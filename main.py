@@ -324,12 +324,12 @@ class Tower(pygame.sprite.Sprite):
             self.y = 440
 
 
-# combo, combo bar , perfect
 
 
+#GAME OVER SCREEN
 def over_screen():
     over = over_font.render("GAME OVER", True, (0, 0, 0))
-    high_score = score_font.render("SCORE: " + str(tower.size), True, (0, 0, 0))
+    high_score = score_font.render("SCORE: " + str(score_value), True, (0, 0, 0))
     button = mini_font.render("PRESS ANY BUTTON TO RESTART", True, (0,0,0))
     blank_rect = button.get_rect()
     blank = pygame.Surface((blank_rect.size),pygame.SRCALPHA)
