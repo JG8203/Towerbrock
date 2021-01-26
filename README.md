@@ -1,5 +1,5 @@
 # Towerbrock 
-Tower Building game built using Pygame. Inspired by nokia's Tower Bloxx. 
+Tower Building game built using Pygame. Inspired by Nokia's Tower Bloxx. 
 
 
 # Demo
