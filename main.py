@@ -1,7 +1,146 @@
 import pygame
 from pygame import mixer
 from math import sin, cos
+from pygame.locals import *
+import cv2
+import numpy as np
+import dlib
+import imutils
+from imutils import face_utils
+from scipy.spatial import distance as dist
+import sys
+import threading
+import queue
+import time
+import random
 
+# -------------------------------
+# Blink detection setup
+# -------------------------------
+
+def eye_aspect_ratio(eye):
+    A = dist.euclidean(eye[1], eye[5])
+    B = dist.euclidean(eye[2], eye[4])
+    C = dist.euclidean(eye[0], eye[3])
+    return (A + B) / (2.0 * C)
+
+class BlinkDetector:
+    def __init__(self):
+        self.EYE_AR_THRESH = 0.25  # Increased sensitivity (was 0.22)
+        self.EYE_AR_CONSEC_FRAMES = 2  # Faster detection (was 3)
+        self.counter = 0
+        self.detector = dlib.get_frontal_face_detector()
+        self.predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+        self.lStart, self.lEnd = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
+        self.rStart, self.rEnd = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
+        # Nose landmarks for nose control mode
+        self.nStart, self.nEnd = face_utils.FACIAL_LANDMARKS_IDXS["nose"]
+        
+    def detect_blink_and_nose(self, gray_frame):
+        """Process a frame and return (blink_detected, nose_x_position)"""
+        rects = self.detector(gray_frame, 0)
+        blink_detected = False
+        nose_x = None
+        
+        for rect in rects:
+            shape = self.predictor(gray_frame, rect)
+            shape = face_utils.shape_to_np(shape)
+            
+            # Blink detection
+            leftEye = shape[self.lStart:self.lEnd]
+            rightEye = shape[self.rStart:self.rEnd]
+            leftEAR = eye_aspect_ratio(leftEye)
+            rightEAR = eye_aspect_ratio(rightEye)
+            ear = (leftEAR + rightEAR) / 2.0
+            
+            if ear < self.EYE_AR_THRESH:
+                self.counter += 1
+            else:
+                if self.counter >= self.EYE_AR_CONSEC_FRAMES:
+                    self.counter = 0
+                    blink_detected = True
+                self.counter = 0
+            
+            # Nose detection - get tip of nose (landmark 30)
+            nose_tip = shape[30]  # Nose tip landmark
+            nose_x = nose_tip[0]
+            
+        return blink_detected, nose_x
+
+class CameraThread(threading.Thread):
+    def __init__(self, frame_queue, blink_queue, nose_queue):
+        super().__init__()
+        self.frame_queue = frame_queue
+        self.blink_queue = blink_queue
+        self.nose_queue = nose_queue
+        self.camera = cv2.VideoCapture(0)
+        self.blink_detector = BlinkDetector()
+        self.running = True
+        self.daemon = True  # Dies when main thread dies
+        
+        # Set camera properties for better performance
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.camera.set(cv2.CAP_PROP_FPS, 30)
+        
+    def run(self):
+        """Main camera processing loop running in separate thread"""
+        while self.running and self.camera.isOpened():
+            ret, frame = self.camera.read()
+            if not ret:
+                continue
+                
+            # Mirror the frame
+            frame = cv2.flip(frame, 1)
+            
+            # Process both blink and nose detection
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blink_detected, nose_x = self.blink_detector.detect_blink_and_nose(gray)
+            
+            # Convert frame for pygame display
+            display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            display_frame = np.rot90(display_frame)
+            
+            # Put frame in queue (non-blocking, replace old frame if queue is full)
+            try:
+                self.frame_queue.put_nowait(display_frame)
+            except queue.Full:
+                try:
+                    self.frame_queue.get_nowait()  # Remove old frame
+                    self.frame_queue.put_nowait(display_frame)  # Add new frame
+                except queue.Empty:
+                    pass
+            
+            # Put blink detection result in queue
+            if blink_detected:
+                try:
+                    self.blink_queue.put_nowait(True)
+                except queue.Full:
+                    pass  # Skip if queue is full
+            
+            # Put nose position in queue
+            if nose_x is not None:
+                try:
+                    self.nose_queue.put_nowait(nose_x)
+                except queue.Full:
+                    try:
+                        self.nose_queue.get_nowait()  # Remove old position
+                        self.nose_queue.put_nowait(nose_x)  # Add new position
+                    except queue.Empty:
+                        pass
+                    
+            # More frequent checking (was 0.016)
+            time.sleep(0.008)  # ~120 FPS for camera thread
+    
+    def stop(self):
+        """Stop the camera thread"""
+        self.running = False
+        if self.camera.isOpened():
+            self.camera.release()
+
+# -------------------------------
+# Game setup
+# -------------------------------
 pygame.init()
 pygame.mixer.pre_init(44100, 16, 2, 4096)
 pygame.mixer.init()
@@ -9,7 +148,6 @@ screen = pygame.display.set_mode((800, 600))
 pygame.display.set_caption("Tower Brocks")
 icon = pygame.image.load("assets/icon.png")
 pygame.display.set_icon(icon)
-
 
 #background
 background = pygame.image.load("assets/background0.jpg")
@@ -54,7 +192,6 @@ def show_score(x,y):
     score = score_font.render("Score: " + str(score_value), True, (0,0,0))
     screen.blit(score,(x,y))
 
-
 class Block(pygame.sprite.Sprite):
     def __init__(self):
         pygame.sprite.Sprite.__init__(self)
@@ -71,15 +208,70 @@ class Block(pygame.sprite.Sprite):
         # ready, dropped , landed, scroll ,over
         self.state = "ready"
         self.angle = 45
-        #screen.blit(self.image, (self.x, self.y))
-
-    def swing(self):
+        
+        # Nose control variables
+        self.nose_control_active = False
+        self.nose_x_position = None
+        self.base_swing_speed = 0.02  # Base swing speed for nose control
+        self.sine_time = 0  # For sine wave oscillation
+        
+    def toggle_nose_control(self):
+        """Toggle between blink and nose control modes"""
+        self.nose_control_active = not self.nose_control_active
+        if self.nose_control_active:
+            print("🐽 Nose control activated! Move your nose to control the pendulum!")
+        else:
+            print("👁️ Blink control activated! Blink to drop blocks!")
+    
+    def update_nose_position(self, nose_x, tower_level):
+        """Update nose position for nose control"""
+        if nose_x is not None:
+            self.nose_x_position = nose_x
+    
+    def swing(self, tower_level=0):
+        if self.nose_control_active and self.nose_x_position is not None:
+            self.nose_swing(tower_level)
+        else:
+            self.normal_swing()
+    
+    def normal_swing(self):
+        """Original swinging behavior"""
         self.x = 370 + rope_length * sin(self.angle)
         self.y = 20 + rope_length * cos(self.angle)
         self.angle += self.speed
         self.acceleration = sin(self.angle) * force
         self.speed += self.acceleration
-        #print(self.speed)
+    
+    def nose_swing(self, tower_level):
+        """Nose-controlled swinging with increasing wildness"""
+        # Calculate wildness factor (0.0 to 1.0, max at level 100)
+        wildness = min(tower_level / 100.0, 1.0)
+        
+        # Map nose position to screen coordinates (assuming 640px camera width)
+        # Nose X ranges roughly from 100-540, map to pendulum range
+        nose_normalized = (self.nose_x_position - 320) / 320.0  # -1 to 1
+        nose_normalized = max(-1, min(1, nose_normalized))  # Clamp
+        
+        # Base angle from nose position
+        base_angle = nose_normalized * 1.2  # Pendulum range in radians
+        
+        # Add sine wave oscillation that increases with wildness
+        self.sine_time += 0.1 + (wildness * 0.3)  # Faster oscillation at higher levels
+        sine_amplitude = wildness * 0.8  # More wild swinging at higher levels
+        sine_offset = sin(self.sine_time) * sine_amplitude
+        
+        # Combine base angle with sine oscillation
+        self.angle = base_angle + sine_offset
+        
+        # Apply position
+        self.x = 370 + rope_length * sin(self.angle)
+        self.y = 20 + rope_length * cos(self.angle)
+        
+        # Add some randomness for chaos at high levels
+        if wildness > 0.5:
+            chaos_factor = (wildness - 0.5) * 2  # 0 to 1
+            chaos_offset = (random.random() - 0.5) * chaos_factor * 0.3
+            self.angle += chaos_offset
 
     def drop(self, tower):
         if self.state == "ready":
@@ -134,7 +326,6 @@ class Block(pygame.sprite.Sprite):
         if direction == "r":
             self.angle -= 1 % 360
 
-
     def to_fall(self, tower):
         self.y += 5
 
@@ -145,7 +336,6 @@ class Block(pygame.sprite.Sprite):
         elif (self.xlast > tower.xlist[-2] - 30):
             self.x += 2
             self.rotate("r")
-
 
     def display(self, tower):
         if not tower.is_scrolling():
@@ -162,7 +352,6 @@ class Block(pygame.sprite.Sprite):
         pygame.draw.aaline(screen, (0, 0, 0), (398,3), (self.x + 30, self.y))
         pygame.draw.circle(screen, (200, 0, 0), (int(self.x+32),int(self.y+2.5)), 5, 0)
 
-
     def respawn(self, tower):
         if tower.size%2 ==0:
             self.angle = -45
@@ -174,7 +363,6 @@ class Block(pygame.sprite.Sprite):
         self.state = "ready"
         global force
         force *= 1.02
-
 
 class Tower(pygame.sprite.Sprite):
     def __init__(self):
@@ -197,6 +385,13 @@ class Tower(pygame.sprite.Sprite):
         self.golden = False
         self.redraw = False
         self.display_status = True
+        
+        # Shaking system
+        self.shake_x = 0
+        self.shake_y = 0
+        self.shake_intensity = 0
+        self.shake_timer = 0
+        self.base_shake_speed = 8  # How fast the shake oscillates
 
     def get_display(self):
         return self.display_status
@@ -207,7 +402,6 @@ class Tower(pygame.sprite.Sprite):
     def is_golden(self):
         return self.golden
 
-
     def build(self):
         self.size += 1
         self.onscreen += 1
@@ -215,7 +409,6 @@ class Tower(pygame.sprite.Sprite):
         if self.size == 1:
             self.xbase = brock.xlast
             self.xlist.append(self.xbase)
-
         else:
             self.xlist.append(brock.xlast)
 
@@ -226,7 +419,6 @@ class Tower(pygame.sprite.Sprite):
             self.height += 64
             self.y -= 64
 
-    #positive if towards right, negative if towards left
     def get_width(self):
         width = 64
         if tower.size == 0 or tower.size == -1:
@@ -234,11 +426,9 @@ class Tower(pygame.sprite.Sprite):
         # newblock to the right
         if self.xlist[-1] > self.xbase:
             width = (self.xlist[-1] - self.xbase) + 64
-
         # new block to the left
         if self.xlist[-1] < self.xbase:
             width = -((self.xbase - self.xlist[-1]) + 64)
-
         return width
 
     def draw(self):
@@ -258,12 +448,10 @@ class Tower(pygame.sprite.Sprite):
             buildlist = self.xlist
             for i in range(len(buildlist)):
                 surf.blit(self.image, (buildlist[i], self.onscreen*64 - 64 * (i + 1)))
-
         else:
              surf = pygame.Surface((0,0))
 
         self.rect = surf.get_rect()
-
         return surf
 
     def unbuild(self, brock):
@@ -277,7 +465,6 @@ class Tower(pygame.sprite.Sprite):
         for i in range(len(buildlist)):
             surf.blit(self.image, (buildlist[i], (self.onscreen-1) * 64 - 64 * (i + 1)))
         self.rect = surf.get_rect()
-
         screen.blit(surf, (self.x+self.change, self.y+64))
 
     def collapse(self, direction):
@@ -289,6 +476,9 @@ class Tower(pygame.sprite.Sprite):
 
     def wobble(self):
         width = self.get_width()
+        abs_width = abs(width)
+        
+        # Determine if tower should be wobbling (existing logic)
         if ((width > 100 or width <-100) and tower.size>=5) or tower.size >=20:
             self.wobbling = True
 
@@ -297,21 +487,83 @@ class Tower(pygame.sprite.Sprite):
 
         if self.change > 20:
             self.speed = -0.4
-
         elif self.change < -20:
             self.speed = 0.4
-
+            
+        # Calculate shake intensity based on tower instability
+        self.calculate_shake_intensity(abs_width)
+        
+        # Apply shaking if intensity > 0
+        if self.shake_intensity > 0:
+            self.update_shake()
+    
+    def calculate_shake_intensity(self, abs_width):
+        """Calculate how much the tower should shake based on instability"""
+        # Base shake intensity on tower width deviation and height
+        base_intensity = 0
+        
+        # Light shake: slightly off-center but stable
+        if abs_width > 80:
+            base_intensity = 1
+        
+        # Medium shake: moderately unstable
+        if abs_width > 120:
+            base_intensity = 2
+            
+        # Heavy shake: very unstable
+        if abs_width > 160:
+            base_intensity = 3
+            
+        # Extreme shake: about to collapse
+        if abs_width > 200 or self.size >= 18:
+            base_intensity = 4
+        
+        # Increase intensity with tower height
+        height_multiplier = min(1.5, 1 + (self.size * 0.05))
+        
+        self.shake_intensity = int(base_intensity * height_multiplier)
+    
+    def update_shake(self):
+        """Update the shake offset based on intensity"""
+        if self.shake_intensity <= 0:
+            self.shake_x = 0
+            self.shake_y = 0
+            return
+            
+        self.shake_timer += 1
+        
+        # Different shake patterns based on intensity
+        if self.shake_intensity == 1:  # Light shake
+            self.shake_x = random.randint(-1, 1)
+            self.shake_y = random.randint(-1, 1) if self.shake_timer % 3 == 0 else 0
+            
+        elif self.shake_intensity == 2:  # Medium shake
+            self.shake_x = random.randint(-2, 2)
+            self.shake_y = random.randint(-1, 1)
+            
+        elif self.shake_intensity == 3:  # Heavy shake
+            self.shake_x = random.randint(-4, 4)
+            self.shake_y = random.randint(-2, 2)
+            
+        elif self.shake_intensity >= 4:  # Extreme shake
+            self.shake_x = random.randint(-6, 6)
+            self.shake_y = random.randint(-3, 3)
+            # Add some extra violent movements
+            if self.shake_timer % 5 == 0:
+                self.shake_x += random.choice([-3, 3])
+                self.shake_y += random.choice([-2, 2])
 
     def display(self):
         surf = self.draw()
-        screen.blit(surf, (self.x+self.change, self.y))
-
+        # Apply both wobble and shake effects
+        final_x = self.x + self.change + self.shake_x
+        final_y = self.y + self.shake_y
+        screen.blit(surf, (final_x, final_y))
 
     def scroll(self):
         if self.y <= 440:
             self.y +=5
             self.scrolling = True
-
         else:
             self.height = 160
             self.scrolling = False
@@ -322,9 +574,12 @@ class Tower(pygame.sprite.Sprite):
         if self.onscreen >=7:
             self.onscreen = 3
             self.y = 440
-
-
-
+        
+        # Reset shake effects when tower resets
+        self.shake_x = 0
+        self.shake_y = 0
+        self.shake_intensity = 0
+        self.shake_timer = 0
 
 #GAME OVER SCREEN
 def over_screen():
@@ -338,7 +593,6 @@ def over_screen():
     index = 1
     waiting = True
     while waiting:
-        #clock.tick
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
@@ -347,7 +601,6 @@ def over_screen():
             if event.type == BLINK_EVENT:
                 if index ==0:
                     index = 1
-
                 else:
                     index = 0
 
@@ -358,119 +611,148 @@ def over_screen():
         screen.blit(instructions[index], (270, 450))
         pygame.display.update()
 
-
-
+# Initialize game objects
 brock = Block()
 tower = Tower()
-
 gameover = False
 running = True
+clock = pygame.time.Clock()
 
-while running:
-    clock.tick(120)
-    screen.fill((255, 255, 255))
+# Create queues for thread communication
+frame_queue = queue.Queue(maxsize=2)  # Small queue to keep latest frames
+blink_queue = queue.Queue(maxsize=10)  # Queue for blink events
+nose_queue = queue.Queue(maxsize=5)   # Queue for nose positions
 
-    #background loop
-    if screenY < 1200:
-        screen.blit(background2, (screenX,screenY-600))
-        screen.blit(background,(screenX,screenY))
-        screen.blit(background2, (screenX, screenY - 1200))
-    else:
-        screen.blit(background2, (screenX, screenY - 1800))
-        screen.blit(background2,(screenX,screenY-1200))
-        if screenY % 600 == 0:
-            screenY = 1200
+# Start camera thread
+camera_thread = CameraThread(frame_queue, blink_queue, nose_queue)
+camera_thread.start()
 
-    if gameover:
-        gameover = False
-        over_screen()
-        brock = Block()
-        tower = Tower()
-        screenY = 0
-        force = -0.001
-        score_value = 0
-    else:
-        # score
-        show_score(textX, textY)
+# Keep track of the last valid frame to prevent flashing
+last_frame_surface = None
 
+print("Starting threaded Tower Brocks game...")
+print("👁️ Blink to drop blocks!")
+print("🎮 Press 'F' to toggle nose control mode!")
 
-    for event in pygame.event.get():
+# -------------------------------
+# Main game loop
+# -------------------------------
+try:
+    while running:
+        clock.tick(60)
 
-        if event.type == pygame.QUIT:
-            running = False
+        # Get latest frame from camera thread (non-blocking)
+        try:
+            latest_frame = frame_queue.get_nowait()
+            frame_surface = pygame.surfarray.make_surface(latest_frame)
+            frame_surface = pygame.transform.scale(frame_surface, (800, 600))
+            last_frame_surface = frame_surface  # Keep track of last valid frame
+        except queue.Empty:
+            frame_surface = last_frame_surface  # Use last known frame
 
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_SPACE:
-                if brock.get_state() == "ready":
-                    brock.drop(tower)
+        # Check for blink events
+        blinked = False
+        while True:
+            try:
+                blink_queue.get_nowait()  # Get blink event
+                blinked = True
+                if not brock.nose_control_active:  # Only print if in blink mode
+                    print("👁️ Blink detected!")
+            except queue.Empty:
+                break  # No more blink events
+        
+        # Get latest nose position
+        latest_nose_x = None
+        while True:
+            try:
+                latest_nose_x = nose_queue.get_nowait()  # Get latest nose position
+            except queue.Empty:
+                break  # No more nose positions
+        
+        # Update nose position in block
+        if latest_nose_x is not None:
+            brock.update_nose_position(latest_nose_x, tower.size)
 
+        # Draw webcam feed only (no fallback to default background)
+        if frame_surface:
+            screen.blit(frame_surface, (0, 0))
+        else:
+            screen.fill((0, 0, 0))  # Black screen if no camera feed available yet
 
-    if brock.get_state() == "ready":
-        brock.swing()
+        # ---- Control system (blink or nose) ----
+        if not brock.nose_control_active and blinked and brock.get_state() == "ready":
+            brock.drop(tower)
 
-    if brock.get_state() == "dropped":
-        brock.drop(tower)
+        # ---- Game logic (same as before) ----
+        if gameover:
+            gameover = False
+            over_screen()
+            brock = Block()
+            tower = Tower()
+            force = -0.001
+            score_value = 0
+        else:
+            show_score(textX, textY)
+            
+            # Show control mode indicator
+            mode_text = "🐽 Nose Control" if brock.nose_control_active else "👁️ Blink Control"
+            mode_color = (0, 255, 0) if brock.nose_control_active else (255, 255, 255)
+            mode_surface = mini_font.render(mode_text, True, mode_color)
+            screen.blit(mode_surface, (10, 550))
 
-    if brock.get_state() == "landed":
-        if brock.to_build(tower):
-            tower.build()
-            if tower.is_golden():
-                gold_build_sound.play()
-                score_value += 2
-            else:
-                build_sound.play()
-                score_value += 1
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_f:  # Secret F key toggle
+                    brock.toggle_nose_control()
 
-        if tower.size >=2:
-            brock.collapse(tower)
+        if brock.get_state() == "ready":
+            brock.swing(tower.size)  # Pass tower level for wildness calculation
+        if brock.get_state() == "dropped":
+            brock.drop(tower)
+        if brock.get_state() == "landed":
+            if brock.to_build(tower):
+                tower.build()
+                if tower.is_golden():
+                    gold_build_sound.play()
+                    score_value += 2
+                else:
+                    build_sound.play()
+                    score_value += 1
+            if tower.size >= 2:
+                brock.collapse(tower)
+        if brock.get_state() == "over":
+            tower.unbuild(brock)
+            brock.to_fall(tower)
+            fall_sound.play()
+            over_music.play()
+            gameover = True  # Trigger game over
+        if brock.get_state() == "scroll" and not tower.is_scrolling():
+            brock.respawn(tower)
+            if tower.size >= 5:
+                tower.reset()
+        if tower.height >= 64*5 and tower.size >= 5:
+            tower.scroll()
 
-    if brock.get_state() == "over":
-        tower.unbuild(brock)
-        brock.to_fall(tower)
-        fall_sound.play()
-        over_music.play()
+        # Display tower + block
+        tower.wobble()
+        if tower.get_display():
+            tower.display()
+        brock.display(tower)
 
-    if brock.get_state() == "scroll" and not tower.is_scrolling():
-        brock.respawn(tower)
-        if tower.size >=5:
-            tower.reset()
+        pygame.display.update()
 
-    if tower.height >= 64*5 and tower.size >=5:
-        tower.scroll()
-        screenY +=5
-
-
-    #standard display
-    tower.wobble()
-    if tower.get_display() == True:
-        tower.display()
-    brock.display(tower)
-
-    #game over sequence
-    if tower.get_width()<-140:
-        tower.collapse("l")
-        over_music.play()
-
-    elif tower.get_width()>140:
-        tower.collapse("r")
-        over_music.play()
-
-    #after tower collapse, block dont respawn
-    if tower.y >600:
-        brock.x = 2000
-        tower.size -= 1
-        gameover = True
-    #after block collapse, tower dissapear
-    elif brock.get_state() == "over" and brock.y > 600:
-        tower.y = 2000
-        tower.size -= 1
-        gameover = True
-
-    elif brock.get_state() == "miss":
-        over_music.play()
-        tower.y = 2000
-        gameover = True
-
-
-    pygame.display.update()
-
+except KeyboardInterrupt:
+    print("Game interrupted by user")
+    
+finally:
+    # Clean up
+    print("Cleaning up...")
+    running = False
+    camera_thread.stop()
+    camera_thread.join(timeout=2)  # Wait up to 2 seconds for thread to finish
+    
+    cv2.destroyAllWindows()
+    pygame.quit()
+    print("Cleanup complete")
